@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.3.11505.172 d18.3
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Broadcast", "src\Broadcast.csproj", "{523FF43B-F9E7-FAB3-AF7B-E1E655CC9F06}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{523FF43B-F9E7-FAB3-AF7B-E1E655CC9F06}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{523FF43B-F9E7-FAB3-AF7B-E1E655CC9F06}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{523FF43B-F9E7-FAB3-AF7B-E1E655CC9F06}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{523FF43B-F9E7-FAB3-AF7B-E1E655CC9F06}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {2E3D50B6-FF25-4A67-90E6-BD1FA3DF251D}
+	EndGlobalSection
+EndGlobal
