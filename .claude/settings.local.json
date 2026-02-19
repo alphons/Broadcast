@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(dotnet:*)",
+      "WebFetch(domain:www.milanjovanovic.tech)",
+      "WebFetch(domain:developer.chrome.com)",
+      "WebFetch(domain:fullstackcity.com)",
+      "Bash(while read f)",
+      "Bash(do if strings \"$f\")",
+      "Bash(then)",
+      "Bash(echo:*)",
+      "Bash(fi)",
+      "Bash(done)",
+      "Bash(then basename \"$f\" strings \"$f\")",
+      "Bash(Remove-Item -Recurse -Force \"D:/temp/Broadcast/tmp_check\")"
+    ]
+  }
+}

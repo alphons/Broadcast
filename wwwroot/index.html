@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Live Stream</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      margin: 0;
+      padding: 1.5rem;
+      background: #0f0f0f;
+      color: #e0e0e0;
+      min-height: 100vh;
+    }
+
+    h1 { color: #fff; margin-bottom: 1.5rem; font-size: 1.6rem; }
+    h2 { color: #ccc; margin: 0 0 1rem; font-size: 1.2rem; }
+
+    #mode-select {
+      display: flex;
+      gap: 0.75rem;
+      margin-bottom: 2rem;
+    }
+
+    .mode-btn {
+      padding: 0.6rem 1.4rem;
+      border: 2px solid #444;
+      background: #1a1a1a;
+      color: #ccc;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 1rem;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .mode-btn:hover { border-color: #888; color: #fff; }
+    .mode-btn.active { border-color: #4a9eff; color: #4a9eff; }
+
+    .section {
+      display: none;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 10px;
+      padding: 1.5rem;
+      max-width: 760px;
+    }
+    .section.active { display: block; }
+
+    video {
+      width: 100%;
+      max-width: 720px;
+      height: 405px;
+      background: #000;
+      display: block;
+      border-radius: 6px;
+      margin-bottom: 1rem;
+      border: 1px solid #333;
+    }
+
+    .controls { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+
+    button {
+      padding: 0.5rem 1.1rem;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-primary { background: #4a9eff; color: #fff; }
+    .btn-danger  { background: #e05252; color: #fff; }
+    .btn-neutral { background: #444; color: #ddd; }
+
+    .status {
+      font-size: 0.85rem;
+      color: #888;
+      padding: 0.4rem 0;
+      min-height: 1.4em;
+    }
+    .status.ok  { color: #5cb85c; }
+    .status.err { color: #e05252; }
+    .status.info{ color: #4a9eff; }
+
+    .stat-bar {
+      margin-top: 1rem;
+      font-size: 0.8rem;
+      color: #666;
+      border-top: 1px solid #2a2a2a;
+      padding-top: 0.75rem;
+    }
+    .stat-bar span { margin-right: 1.5rem; }
+  </style>
+</head>
+<body>
+
+<h1>Live Stream</h1>
+
+<div id="mode-select">
+  <button class="mode-btn" onclick="showSection('broadcaster')">Uitzenden</button>
+  <button class="mode-btn" onclick="showSection('viewer')">Kijken</button>
+</div>
+
+<!-- ===== BROADCASTER ===== -->
+<div id="broadcaster" class="section">
+  <h2>Uitzenden</h2>
+  <video id="broadcaster-preview" autoplay muted playsinline></video>
+  <div class="controls">
+    <button id="b-start" class="btn-primary" onclick="startBroadcast()">Start Uitzending</button>
+    <button id="b-stop"  class="btn-danger"  onclick="stopBroadcast()"  disabled>Stop Uitzending</button>
+  </div>
+  <div id="b-status" class="status">Niet actief</div>
+  <div class="stat-bar">
+    <span>Chunks verzonden: <b id="b-chunks">0</b></span>
+    <span>Kijkers: <b id="b-viewers">0</b></span>
+  </div>
+</div>
+
+<!-- ===== VIEWER ===== -->
+<div id="viewer" class="section">
+  <h2>Kijken</h2>
+  <video id="viewer-video" autoplay playsinline controls></video>
+  <div class="controls">
+    <button id="v-start" class="btn-primary" onclick="startWatching()">Verbinden</button>
+    <button id="v-stop"  class="btn-danger"  onclick="stopWatching()"  disabled>Verbreken</button>
+  </div>
+  <div id="v-status" class="status">Niet verbonden</div>
+  <div class="stat-bar">
+    <span>Ontvangen chunks: <b id="v-chunks">0</b></span>
+    <span>Buffer wachtrij: <b id="v-queue">0</b></span>
+  </div>
+</div>
+
+<script>
+// ===========================================================================
+// UTILITY
+// ===========================================================================
+function showSection(name) {
+  ['broadcaster', 'viewer'].forEach(id => {
+    document.getElementById(id).classList.remove('active');
+  });
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(name).classList.add('active');
+  document.querySelector(`.mode-btn[onclick="showSection('${name}')"]`).classList.add('active');
+}
+
+function setStatus(elId, text, cls = '') {
+  const el = document.getElementById(elId);
+  el.className = 'status ' + cls;
+  el.textContent = text;
+}
+
+// ===========================================================================
+// BROADCASTER
+// ===========================================================================
+let mediaRecorder = null;
+let broadcastStream = null;
+let bChunkCount = 0;
+let bViewerPoll = null;
+
+function selectMimeType() {
+  const candidates = [
+    'video/webm;codecs=vp8,opus',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8',
+    'video/webm'
+  ];
+  for (const t of candidates) {
+    if (MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
+}
+
+async function startBroadcast() {
+  try {
+    // Reset server state for a fresh broadcast session
+    await fetch('/api/stream/reset', { method: 'POST' });
+
+    broadcastStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      audio: true
+    });
+  } catch (err) {
+    setStatus('b-status', 'Fout: ' + err.message, 'err');
+    return;
+  }
+
+  document.getElementById('broadcaster-preview').srcObject = broadcastStream;
+
+  const mimeType = selectMimeType();
+  if (!mimeType) {
+    setStatus('b-status', 'Geen ondersteunde video codec gevonden.', 'err');
+    return;
+  }
+
+  bChunkCount = 0;
+  document.getElementById('b-chunks').textContent = '0';
+
+  mediaRecorder = new MediaRecorder(broadcastStream, {
+    mimeType,
+    videoBitsPerSecond: 1_500_000,
+    audioBitsPerSecond: 128_000
+  });
+
+  mediaRecorder.ondataavailable = async (event) => {
+    if (!event.data || event.data.size === 0) return;
+
+    bChunkCount++;
+    document.getElementById('b-chunks').textContent = bChunkCount;
+
+    try {
+      const res = await fetch('/api/stream/broadcast', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Mime-Type': mimeType
+        },
+        body: event.data
+      });
+      if (res.ok) {
+        const json = await res.json();
+        document.getElementById('b-viewers').textContent = json.viewers ?? 0;
+        setStatus('b-status', `Actief — codec: ${mimeType}`, 'ok');
+      } else {
+        setStatus('b-status', `Server fout: ${res.status}`, 'err');
+      }
+    } catch (err) {
+      setStatus('b-status', 'Netwerkfout: ' + err.message, 'err');
+    }
+  };
+
+  mediaRecorder.onerror = (err) => {
+    setStatus('b-status', 'MediaRecorder fout: ' + err.error?.message, 'err');
+  };
+
+  // timeslice 250ms: first dataavailable = WebM EBML init, rest = media clusters
+  mediaRecorder.start(250);
+
+  document.getElementById('b-start').disabled = true;
+  document.getElementById('b-stop').disabled = false;
+  setStatus('b-status', 'Starten...', 'info');
+}
+
+function stopBroadcast() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+  }
+  mediaRecorder = null;
+
+  if (broadcastStream) {
+    broadcastStream.getTracks().forEach(t => t.stop());
+    broadcastStream = null;
+  }
+
+  document.getElementById('broadcaster-preview').srcObject = null;
+  document.getElementById('b-start').disabled = false;
+  document.getElementById('b-stop').disabled = true;
+  setStatus('b-status', 'Gestopt');
+}
+
+// ===========================================================================
+// VIEWER
+// ===========================================================================
+let eventSource = null;
+let mediaSource = null;
+let sourceBuffer = null;
+let pendingChunks = [];
+let initReceived = false;
+let isAppending = false;
+let vChunkCount = 0;
+let activeMime = 'video/webm;codecs=vp8,opus';
+
+// Queue of mime types to try when addSourceBuffer fails
+const MIME_CANDIDATES = [
+  'video/webm;codecs=vp8,opus',
+  'video/webm;codecs=vp9,opus',
+  'video/webm;codecs=vp8',
+  'video/webm'
+];
+
+function base64ToUint8Array(b64) {
+  const binary = atob(b64);
+  const buf = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
+  return buf;
+}
+
+function drainQueue() {
+  if (isAppending) return;
+  if (!sourceBuffer || sourceBuffer.updating) return;
+  if (pendingChunks.length === 0) return;
+  if (!mediaSource || mediaSource.readyState !== 'open') return;
+
+  isAppending = true;
+  const item = pendingChunks.shift();
+  document.getElementById('v-queue').textContent = pendingChunks.length;
+
+  // CRITICAL: register updateend listener BEFORE calling appendBuffer.
+  // appendBuffer can fire updateend synchronously in some browsers/conditions.
+  // If the listener is added after, the event is missed and the queue stalls forever.
+  function onUpdateEnd() {
+    isAppending = false;
+    drainQueue();
+  }
+  sourceBuffer.addEventListener('updateend', onUpdateEnd, { once: true });
+
+  try {
+    sourceBuffer.appendBuffer(item.data);
+  } catch (err) {
+    // appendBuffer threw synchronously — remove the listener and clean up.
+    sourceBuffer.removeEventListener('updateend', onUpdateEnd);
+    console.error('appendBuffer error:', err);
+    isAppending = false;
+    if (err.name === 'QuotaExceededError' && sourceBuffer) {
+      try {
+        const currentTime = document.getElementById('viewer-video').currentTime;
+        if (currentTime > 30) {
+          sourceBuffer.remove(0, currentTime - 30);
+        }
+      } catch (e2) { /* ignore */ }
+    }
+  }
+}
+
+async function openSourceBuffer(video) {
+  // Fetch the broadcaster's actual mimeType from the server.
+  // This ensures addSourceBuffer uses the exact same codec string.
+  let serverMime = '';
+  try {
+    const res = await fetch('/api/stream/info');
+    if (res.ok) {
+      const info = await res.json();
+      serverMime = info.mimeType || '';
+    }
+  } catch (e) { /* ignore, fall through to candidates */ }
+
+  // Build candidate list: server-reported mime first, then fallbacks.
+  const candidates = serverMime
+    ? [serverMime, ...MIME_CANDIDATES.filter(m => m !== serverMime)]
+    : MIME_CANDIDATES;
+
+  for (const mime of candidates) {
+    if (!MediaSource.isTypeSupported(mime)) continue;
+    try {
+      sourceBuffer = mediaSource.addSourceBuffer(mime);
+      sourceBuffer.mode = 'sequence';
+      activeMime = mime;
+      setStatus('v-status', `MediaSource gereed (${mime}). Wachten op stream...`, 'info');
+      connectEventSource();
+      return;
+    } catch (e) {
+      // try next
+    }
+  }
+  setStatus('v-status', 'Geen ondersteunde MSE codec beschikbaar.', 'err');
+}
+
+function startWatching() {
+  const video = document.getElementById('viewer-video');
+
+  // Reset state
+  pendingChunks = [];
+  initReceived = false;
+  isAppending = false;
+  vChunkCount = 0;
+  document.getElementById('v-chunks').textContent = '0';
+  document.getElementById('v-queue').textContent = '0';
+
+  mediaSource = new MediaSource();
+  video.src = URL.createObjectURL(mediaSource);
+
+  mediaSource.addEventListener('sourceopen', () => openSourceBuffer(video));
+  mediaSource.addEventListener('sourceended', () => {
+    setStatus('v-status', 'Stream beëindigd door server.', 'info');
+  });
+  mediaSource.addEventListener('sourceclose', () => {
+    setStatus('v-status', 'MediaSource gesloten.', 'info');
+  });
+
+  document.getElementById('v-start').disabled = true;
+  document.getElementById('v-stop').disabled = false;
+  setStatus('v-status', 'Verbinden...', 'info');
+}
+
+function connectEventSource() {
+  // EventSource opens a persistent GET /api/stream/watch
+  // Browser auto-reconnects and sends Last-Event-ID on reconnect
+  eventSource = new EventSource('/api/stream/watch');
+
+  eventSource.onopen = () => {
+    setStatus('v-status', 'Verbonden. Wachten op initialisatie...', 'info');
+  };
+
+  // "init" event: WebM EBML header — must be the FIRST thing appended to SourceBuffer
+  eventSource.addEventListener('init', (event) => {
+    const bytes = base64ToUint8Array(event.data);
+    // Always replace pending queue with just the init when we (re)receive it
+    pendingChunks = [{ data: bytes }];
+    initReceived = true;
+    vChunkCount = 0;
+    document.getElementById('v-chunks').textContent = '0';
+    setStatus('v-status', 'Init ontvangen, bufferen...', 'info');
+    drainQueue();
+  });
+
+  // "chunk" event: regular WebM media cluster
+  eventSource.addEventListener('chunk', (event) => {
+    if (!initReceived) return; // Safety: never append before init
+    const bytes = base64ToUint8Array(event.data);
+    pendingChunks.push({ data: bytes });
+    vChunkCount++;
+    document.getElementById('v-chunks').textContent = vChunkCount;
+    document.getElementById('v-queue').textContent = pendingChunks.length;
+    drainQueue();
+
+    // Auto-play if paused (can happen when buffering)
+    const video = document.getElementById('viewer-video');
+    if (video.paused && video.readyState >= 3) {
+      video.play().catch(() => {});
+    }
+
+    if (vChunkCount === 1) {
+      setStatus('v-status', 'Stream actief.', 'ok');
+    }
+  });
+
+  eventSource.onerror = (err) => {
+    // EventSource automatically retries; this is informational only
+    setStatus('v-status', 'Verbinding onderbroken, opnieuw verbinden...', 'err');
+    // On reconnect the server will re-send the init segment first (pre-queued in AddViewer)
+    initReceived = false;
+    pendingChunks = [];
+    isAppending = false;
+  };
+}
+
+function stopWatching() {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+
+  // Drain pending state before tearing down MediaSource.
+  pendingChunks = [];
+  initReceived = false;
+  isAppending = false;
+
+  function teardownMediaSource() {
+    try {
+      if (mediaSource && mediaSource.readyState === 'open') {
+        mediaSource.endOfStream();
+      }
+    } catch (e) { /* ignore */ }
+    mediaSource = null;
+    sourceBuffer = null;
+
+    const video = document.getElementById('viewer-video');
+    video.removeAttribute('src');
+    video.load();
+  }
+
+  // If SourceBuffer is still updating, wait for it to finish before calling
+  // endOfStream — calling it while updating=true throws an InvalidStateError.
+  if (sourceBuffer && sourceBuffer.updating) {
+    sourceBuffer.addEventListener('updateend', teardownMediaSource, { once: true });
+  } else {
+    teardownMediaSource();
+  }
+
+  document.getElementById('v-start').disabled = false;
+  document.getElementById('v-stop').disabled = true;
+  setStatus('v-status', 'Verbroken.');
+}
+</script>
+</body>
+</html>
