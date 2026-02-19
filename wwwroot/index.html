@@ -265,16 +265,16 @@ function stopBroadcast() {
 // ===========================================================================
 // VIEWER
 // ===========================================================================
-let eventSource = null;
-let mediaSource = null;
-let sourceBuffer = null;
-let pendingChunks = [];
-let initReceived = false;
-let isAppending = false;
-let vChunkCount = 0;
-let activeMime = 'video/webm;codecs=vp8,opus';
+let eventSource    = null;
+let mediaSource    = null;
+let sourceBuffer   = null;
+let pendingChunks  = [];   // Chunks wachtend om appended te worden
+let initDone       = false; // true zodra init-segment volledig door SourceBuffer verwerkt is
+let isAppending    = false;
+let vChunkCount    = 0;
+let activeMime     = '';
+let liveTimer      = null;  // interval voor live-sync
 
-// Queue of mime types to try when addSourceBuffer fails
 const MIME_CANDIDATES = [
   'video/webm;codecs=vp8,opus',
   'video/webm;codecs=vp9,opus',
@@ -282,11 +282,50 @@ const MIME_CANDIDATES = [
   'video/webm'
 ];
 
+// Max aantal chunks in de wachtrij. Als de queue groeit omdat de browser
+// langzamer verwerkt dan chunks binnenkomen, drop dan de oudste media-chunks
+// (maar nooit de init). Bij live-video is actualiteit belangrijker dan volledigheid.
+const MAX_QUEUE = 20;
+
 function base64ToUint8Array(b64) {
   const binary = atob(b64);
   const buf = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
   return buf;
+}
+
+// Verwijder oude gebufferde data zodat de browser geen geheugenprobleem krijgt.
+// Houd maximaal 20 seconden achter de huidige afspeelpositie.
+function evictOldBuffer() {
+  if (!sourceBuffer || sourceBuffer.updating) return;
+  if (!mediaSource || mediaSource.readyState !== 'open') return;
+  try {
+    const video = document.getElementById('viewer-video');
+    const ct = video.currentTime;
+    if (ct > 20) {
+      sourceBuffer.remove(0, ct - 20);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+// Spring naar het einde van de buffer als we meer dan 1.5 seconde achter lopen.
+// Zo blijft de kijker dicht op live, ook als de browser even heeft gebufferd.
+function syncToLive() {
+  if (!sourceBuffer || !mediaSource || mediaSource.readyState !== 'open') return;
+  if (sourceBuffer.updating) return;
+  const video = document.getElementById('viewer-video');
+  if (video.readyState < 2) return;  // nog niets afgespeeld
+
+  try {
+    const buffered = sourceBuffer.buffered;
+    if (buffered.length === 0) return;
+    const liveEdge = buffered.end(buffered.length - 1);
+    const behind = liveEdge - video.currentTime;
+    if (behind > 1.5) {
+      // Meer dan 1.5s achter — spring naar live edge min een kleine marge
+      video.currentTime = liveEdge - 0.1;
+    }
+  } catch (e) { /* ignore */ }
 }
 
 function drainQueue() {
@@ -299,11 +338,19 @@ function drainQueue() {
   const item = pendingChunks.shift();
   document.getElementById('v-queue').textContent = pendingChunks.length;
 
-  // CRITICAL: register updateend listener BEFORE calling appendBuffer.
-  // appendBuffer can fire updateend synchronously in some browsers/conditions.
-  // If the listener is added after, the event is missed and the queue stalls forever.
+  // CRITICAL: listener registreren VÓÓR appendBuffer aanroepen.
+  // In sommige browsers/situaties kan updateend synchroon vuren.
   function onUpdateEnd() {
     isAppending = false;
+
+    // Als dit de init was, zet initDone op true zodat media-chunks
+    // pas daarna in de queue komen. Zo kan de SourceBuffer nooit
+    // media ontvangen terwijl de codec-initialisatie nog loopt.
+    if (item.isInit) {
+      initDone = true;
+      setStatus('v-status', 'Init verwerkt, stream start...', 'info');
+    }
+
     drainQueue();
   }
   sourceBuffer.addEventListener('updateend', onUpdateEnd, { once: true });
@@ -311,24 +358,44 @@ function drainQueue() {
   try {
     sourceBuffer.appendBuffer(item.data);
   } catch (err) {
-    // appendBuffer threw synchronously — remove the listener and clean up.
     sourceBuffer.removeEventListener('updateend', onUpdateEnd);
-    console.error('appendBuffer error:', err);
+    console.error('appendBuffer error:', err.name, err.message);
     isAppending = false;
-    if (err.name === 'QuotaExceededError' && sourceBuffer) {
-      try {
-        const currentTime = document.getElementById('viewer-video').currentTime;
-        if (currentTime > 30) {
-          sourceBuffer.remove(0, currentTime - 30);
-        }
-      } catch (e2) { /* ignore */ }
+    if (err.name === 'QuotaExceededError') {
+      evictOldBuffer();
+      // Zet het item terug en probeer opnieuw na de evict
+      pendingChunks.unshift(item);
+      setTimeout(drainQueue, 50);
     }
   }
 }
 
-async function openSourceBuffer(video) {
-  // Fetch the broadcaster's actual mimeType from the server.
-  // This ensures addSourceBuffer uses the exact same codec string.
+function queueChunk(data, isInit = false) {
+  if (isInit) {
+    // Init vervangt alles: leeg de queue en begin opnieuw
+    pendingChunks = [{ data, isInit: true }];
+    initDone = false;
+    isAppending = false;
+    drainQueue();
+    return;
+  }
+
+  // Media-chunk: alleen toevoegen als init al verwerkt is
+  if (!initDone) return;
+
+  pendingChunks.push({ data, isInit: false });
+
+  // Begrens de queue: als hij te lang wordt, gooi dan de oudste
+  // media-chunks weg (niet de init). Zo blijven we dicht op live.
+  while (pendingChunks.length > MAX_QUEUE) {
+    pendingChunks.shift();
+  }
+
+  document.getElementById('v-queue').textContent = pendingChunks.length;
+  drainQueue();
+}
+
+async function openSourceBuffer() {
   let serverMime = '';
   try {
     const res = await fetch('/api/stream/info');
@@ -336,9 +403,8 @@ async function openSourceBuffer(video) {
       const info = await res.json();
       serverMime = info.mimeType || '';
     }
-  } catch (e) { /* ignore, fall through to candidates */ }
+  } catch (e) { /* val terug op kandidatenlijst */ }
 
-  // Build candidate list: server-reported mime first, then fallbacks.
   const candidates = serverMime
     ? [serverMime, ...MIME_CANDIDATES.filter(m => m !== serverMime)]
     : MIME_CANDIDATES;
@@ -349,130 +415,109 @@ async function openSourceBuffer(video) {
       sourceBuffer = mediaSource.addSourceBuffer(mime);
       sourceBuffer.mode = 'sequence';
       activeMime = mime;
-      setStatus('v-status', `MediaSource gereed (${mime}). Wachten op stream...`, 'info');
+      setStatus('v-status', `Verbonden (${mime}). Wachten op stream...`, 'info');
       connectEventSource();
+
+      // Elke seconde live-sync controleren
+      liveTimer = setInterval(syncToLive, 1000);
       return;
-    } catch (e) {
-      // try next
-    }
+    } catch (e) { /* probeer volgende */ }
   }
   setStatus('v-status', 'Geen ondersteunde MSE codec beschikbaar.', 'err');
 }
 
 function startWatching() {
-  const video = document.getElementById('viewer-video');
-
-  // Reset state
+  // State resetten
   pendingChunks = [];
-  initReceived = false;
-  isAppending = false;
-  vChunkCount = 0;
+  initDone      = false;
+  isAppending   = false;
+  vChunkCount   = 0;
+  activeMime    = '';
   document.getElementById('v-chunks').textContent = '0';
-  document.getElementById('v-queue').textContent = '0';
+  document.getElementById('v-queue').textContent  = '0';
 
+  const video = document.getElementById('viewer-video');
   mediaSource = new MediaSource();
   video.src = URL.createObjectURL(mediaSource);
 
-  mediaSource.addEventListener('sourceopen', () => openSourceBuffer(video));
-  mediaSource.addEventListener('sourceended', () => {
-    setStatus('v-status', 'Stream beëindigd door server.', 'info');
-  });
-  mediaSource.addEventListener('sourceclose', () => {
-    setStatus('v-status', 'MediaSource gesloten.', 'info');
-  });
+  mediaSource.addEventListener('sourceopen', openSourceBuffer);
+  mediaSource.addEventListener('sourceended', () =>
+    setStatus('v-status', 'Stream beëindigd.', 'info'));
+  mediaSource.addEventListener('sourceclose', () =>
+    setStatus('v-status', 'MediaSource gesloten.', 'info'));
 
   document.getElementById('v-start').disabled = true;
-  document.getElementById('v-stop').disabled = false;
+  document.getElementById('v-stop').disabled  = false;
   setStatus('v-status', 'Verbinden...', 'info');
 }
 
 function connectEventSource() {
-  // EventSource opens a persistent GET /api/stream/watch
-  // Browser auto-reconnects and sends Last-Event-ID on reconnect
   eventSource = new EventSource('/api/stream/watch');
 
-  eventSource.onopen = () => {
-    setStatus('v-status', 'Verbonden. Wachten op initialisatie...', 'info');
-  };
+  eventSource.onopen = () =>
+    setStatus('v-status', 'Verbonden. Wachten op init-segment...', 'info');
 
-  // "init" event: WebM EBML header — must be the FIRST thing appended to SourceBuffer
+  // Init-event: WebM EBML-header — moet EERST in de SourceBuffer
   eventSource.addEventListener('init', (event) => {
-    const bytes = base64ToUint8Array(event.data);
-    // Always replace pending queue with just the init when we (re)receive it
-    pendingChunks = [{ data: bytes }];
-    initReceived = true;
     vChunkCount = 0;
     document.getElementById('v-chunks').textContent = '0';
-    setStatus('v-status', 'Init ontvangen, bufferen...', 'info');
-    drainQueue();
+    setStatus('v-status', 'Init ontvangen, verwerken...', 'info');
+    queueChunk(base64ToUint8Array(event.data), true);
   });
 
-  // "chunk" event: regular WebM media cluster
+  // Chunk-event: gewone WebM media-cluster
   eventSource.addEventListener('chunk', (event) => {
-    if (!initReceived) return; // Safety: never append before init
     const bytes = base64ToUint8Array(event.data);
-    pendingChunks.push({ data: bytes });
+    queueChunk(bytes, false);
     vChunkCount++;
     document.getElementById('v-chunks').textContent = vChunkCount;
-    document.getElementById('v-queue').textContent = pendingChunks.length;
-    drainQueue();
 
-    // Auto-play if paused (can happen when buffering)
+    // Autoplay als video gepauzeerd is maar er wel data is
     const video = document.getElementById('viewer-video');
-    if (video.paused && video.readyState >= 3) {
-      video.play().catch(() => {});
-    }
+    if (video.paused && video.readyState >= 3) video.play().catch(() => {});
 
-    if (vChunkCount === 1) {
-      setStatus('v-status', 'Stream actief.', 'ok');
-    }
+    if (vChunkCount === 1) setStatus('v-status', 'Stream actief.', 'ok');
   });
 
-  eventSource.onerror = (err) => {
-    // EventSource automatically retries; this is informational only
-    setStatus('v-status', 'Verbinding onderbroken, opnieuw verbinden...', 'err');
-    // On reconnect the server will re-send the init segment first (pre-queued in AddViewer)
-    initReceived = false;
+  eventSource.onerror = () => {
+    setStatus('v-status', 'Verbinding onderbroken, herverbinden...', 'err');
+    // Bij herverbinding stuurt de server opnieuw het init-segment;
+    // reset zodat queueChunk dat correct als init behandelt.
+    initDone      = false;
     pendingChunks = [];
-    isAppending = false;
+    isAppending   = false;
   };
 }
 
 function stopWatching() {
-  if (eventSource) {
-    eventSource.close();
-    eventSource = null;
-  }
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
 
-  // Drain pending state before tearing down MediaSource.
+  if (eventSource) { eventSource.close(); eventSource = null; }
+
   pendingChunks = [];
-  initReceived = false;
-  isAppending = false;
+  initDone      = false;
+  isAppending   = false;
 
-  function teardownMediaSource() {
+  function teardown() {
     try {
-      if (mediaSource && mediaSource.readyState === 'open') {
-        mediaSource.endOfStream();
-      }
+      if (mediaSource && mediaSource.readyState === 'open') mediaSource.endOfStream();
     } catch (e) { /* ignore */ }
-    mediaSource = null;
+    mediaSource  = null;
     sourceBuffer = null;
-
     const video = document.getElementById('viewer-video');
     video.removeAttribute('src');
     video.load();
   }
 
-  // If SourceBuffer is still updating, wait for it to finish before calling
-  // endOfStream — calling it while updating=true throws an InvalidStateError.
+  // endOfStream mag niet worden aangeroepen terwijl updating=true
   if (sourceBuffer && sourceBuffer.updating) {
-    sourceBuffer.addEventListener('updateend', teardownMediaSource, { once: true });
+    sourceBuffer.addEventListener('updateend', teardown, { once: true });
   } else {
-    teardownMediaSource();
+    teardown();
   }
 
   document.getElementById('v-start').disabled = false;
-  document.getElementById('v-stop').disabled = true;
+  document.getElementById('v-stop').disabled  = true;
   setStatus('v-status', 'Verbroken.');
 }
 </script>
