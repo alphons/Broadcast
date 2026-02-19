@@ -10,5 +10,6 @@ public sealed class VideoChunk
 {
     public required byte[] Data { get; init; }
     public bool IsInit { get; init; }
+    public bool IsKeyframe { get; init; }
     public long SequenceNumber { get; init; }
 }

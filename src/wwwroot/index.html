@@ -155,12 +155,85 @@ function setStatus(elId, text, cls = '') {
 }
 
 // ===========================================================================
+// WEBM KEYFRAME DETECTION
+// Scans raw WebM bytes for a Cluster containing a SimpleBlock with the
+// keyframe flag (bit 7) set. Used by the broadcaster to tag chunks so
+// the server can track keyframe boundaries without parsing on its side.
+// ===========================================================================
+function webmHasKeyframe(buf) {
+  // Find Cluster element ID: 0x1F 0x43 0xB6 0x75
+  let pos = -1;
+  for (let i = 0; i <= buf.length - 4; i++) {
+    if (buf[i] === 0x1F && buf[i+1] === 0x43 && buf[i+2] === 0xB6 && buf[i+3] === 0x75) {
+      pos = i + 4;
+      break;
+    }
+  }
+  if (pos < 0) return false;
+
+  // Skip the Cluster's VINT size field.
+  const szLen = vintLength(buf, pos);
+  if (szLen === 0) return false;
+  pos += szLen;
+
+  // Walk elements inside the Cluster looking for a SimpleBlock (0xA3).
+  while (pos < buf.length) {
+    if (pos + 1 >= buf.length) break;
+    const elemId = buf[pos++];
+
+    const eSzLen = vintLength(buf, pos);
+    if (eSzLen === 0) break;
+    const elemSize = vintValue(buf, pos, eSzLen);
+    pos += eSzLen;
+
+    if (elemId === 0xA3) {
+      // SimpleBlock: [TrackNumber VINT][Timecode 2B][Flags 1B][frame data]
+      const tLen = vintLength(buf, pos);
+      if (tLen === 0) break;
+      const flagPos = pos + tLen + 2;
+      if (flagPos >= buf.length) break;
+      return (buf[flagPos] & 0x80) !== 0;  // bit 7 = keyframe
+    }
+
+    // Skip element body. elemSize === -1 means unknown size — stop walking.
+    if (elemSize < 0 || pos + elemSize > buf.length) break;
+    pos += elemSize;
+  }
+  return false;
+}
+
+function vintLength(buf, offset) {
+  if (offset >= buf.length) return 0;
+  const b = buf[offset];
+  if (b & 0x80) return 1;
+  if (b & 0x40) return 2;
+  if (b & 0x20) return 3;
+  if (b & 0x10) return 4;
+  if (b & 0x08) return 5;
+  if (b & 0x04) return 6;
+  if (b & 0x02) return 7;
+  if (b & 0x01) return 8;
+  return 0;
+}
+
+function vintValue(buf, offset, len) {
+  const widthBit = 0x80 >> (len - 1);
+  let val = buf[offset] & (widthBit - 1);
+  for (let i = 1; i < len; i++) val = (val * 256) + buf[offset + i];
+  const allOnes = Math.pow(2, 7 * len) - 1;
+  return val === allOnes ? -1 : val;
+}
+
+// ===========================================================================
 // BROADCASTER
 // ===========================================================================
-let mediaRecorder = null;
+let mediaRecorder  = null;
 let broadcastStream = null;
-let bChunkCount = 0;
-let bViewerPoll = null;
+let bChunkCount    = 0;
+
+// Serialiseert chunk-uploads: elke fetch wacht op de vorige zodat chunks
+// altijd in volgorde bij de server aankomen, ook bij async verwerking.
+let uploadChain = Promise.resolve();
 
 function selectMimeType() {
   const candidates = [
@@ -177,7 +250,6 @@ function selectMimeType() {
 
 async function startBroadcast() {
   try {
-    // Reset server state for a fresh broadcast session
     await fetch('/api/stream/reset', { method: 'POST' });
 
     broadcastStream = await navigator.mediaDevices.getUserMedia({
@@ -197,7 +269,9 @@ async function startBroadcast() {
     return;
   }
 
-  bChunkCount = 0;
+  bChunkCount    = 0;
+  uploadChain    = Promise.resolve();
+  let firstChunk = true;   // eerste chunk na reset = init segment
   document.getElementById('b-chunks').textContent = '0';
 
   mediaRecorder = new MediaRecorder(broadcastStream, {
@@ -206,38 +280,52 @@ async function startBroadcast() {
     audioBitsPerSecond: 128_000
   });
 
-  mediaRecorder.ondataavailable = async (event) => {
+  mediaRecorder.ondataavailable = (event) => {
     if (!event.data || event.data.size === 0) return;
 
     bChunkCount++;
     document.getElementById('b-chunks').textContent = bChunkCount;
 
-    try {
-      const res = await fetch('/api/stream/broadcast', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'X-Mime-Type': mimeType
-        },
-        body: event.data
-      });
-      if (res.ok) {
-        const json = await res.json();
-        document.getElementById('b-viewers').textContent = json.viewers ?? 0;
-        setStatus('b-status', `Actief — codec: ${mimeType}`, 'ok');
-      } else {
-        setStatus('b-status', `Server fout: ${res.status}`, 'err');
+    // Capture the Blob immediately — before any await — so each chunk is
+    // enqueued synchronously. The actual upload is chained onto uploadChain
+    // so chunks always arrive at the server in order.
+    const blob = event.data;
+
+    const isInit = firstChunk;
+    firstChunk = false;
+
+    uploadChain = uploadChain.then(async () => {
+      const buf = await blob.arrayBuffer();
+      const isKeyframe = !isInit && webmHasKeyframe(new Uint8Array(buf));
+
+      try {
+        const res = await fetch('/api/stream/broadcast', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-Mime-Type': mimeType,
+            'X-Is-Init':     isInit     ? 'true' : 'false',
+            'X-Is-Keyframe': isKeyframe ? 'true' : 'false'
+          },
+          body: buf
+        });
+        if (res.ok) {
+          const json = await res.json();
+          document.getElementById('b-viewers').textContent = json.viewers ?? 0;
+          setStatus('b-status', `Actief — codec: ${mimeType}`, 'ok');
+        } else {
+          setStatus('b-status', `Server fout: ${res.status}`, 'err');
+        }
+      } catch (err) {
+        setStatus('b-status', 'Netwerkfout: ' + err.message, 'err');
       }
-    } catch (err) {
-      setStatus('b-status', 'Netwerkfout: ' + err.message, 'err');
-    }
+    });
   };
 
   mediaRecorder.onerror = (err) => {
     setStatus('b-status', 'MediaRecorder fout: ' + err.error?.message, 'err');
   };
 
-  // timeslice 250ms: first dataavailable = WebM EBML init, rest = media clusters
   mediaRecorder.start(250);
 
   document.getElementById('b-start').disabled = true;
@@ -246,9 +334,7 @@ async function startBroadcast() {
 }
 
 function stopBroadcast() {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
-  }
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
   mediaRecorder = null;
 
   if (broadcastStream) {
@@ -265,15 +351,15 @@ function stopBroadcast() {
 // ===========================================================================
 // VIEWER
 // ===========================================================================
-let eventSource    = null;
-let mediaSource    = null;
-let sourceBuffer   = null;
-let pendingChunks  = [];   // Chunks wachtend om appended te worden
-let initDone       = false; // true zodra init-segment volledig door SourceBuffer verwerkt is
-let isAppending    = false;
-let vChunkCount    = 0;
-let activeMime     = '';
-let liveTimer      = null;  // interval voor live-sync
+let eventSource   = null;
+let mediaSource   = null;
+let sourceBuffer  = null;
+let pendingChunks = [];   // { data, isInit, isKeyframe }
+let initDone      = false;
+let isAppending   = false;
+let vChunkCount   = 0;
+let activeMime    = '';
+let liveTimer     = null;
 
 const MIME_CANDIDATES = [
   'video/webm;codecs=vp8,opus',
@@ -282,9 +368,6 @@ const MIME_CANDIDATES = [
   'video/webm'
 ];
 
-// Max aantal chunks in de wachtrij. Als de queue groeit omdat de browser
-// langzamer verwerkt dan chunks binnenkomen, drop dan de oudste media-chunks
-// (maar nooit de init). Bij live-video is actualiteit belangrijker dan volledigheid.
 const MAX_QUEUE = 20;
 
 function base64ToUint8Array(b64) {
@@ -294,63 +377,48 @@ function base64ToUint8Array(b64) {
   return buf;
 }
 
-// Verwijder oude gebufferde data zodat de browser geen geheugenprobleem krijgt.
-// Houd maximaal 20 seconden achter de huidige afspeelpositie.
 function evictOldBuffer() {
   if (!sourceBuffer || sourceBuffer.updating) return;
   if (!mediaSource || mediaSource.readyState !== 'open') return;
   try {
-    const video = document.getElementById('viewer-video');
-    const ct = video.currentTime;
-    if (ct > 20) {
-      sourceBuffer.remove(0, ct - 20);
-    }
+    const ct = document.getElementById('viewer-video').currentTime;
+    if (ct > 20) sourceBuffer.remove(0, ct - 20);
   } catch (e) { /* ignore */ }
 }
 
-// Spring naar het einde van de buffer als we meer dan 1.5 seconde achter lopen.
-// Zo blijft de kijker dicht op live, ook als de browser even heeft gebufferd.
 function syncToLive() {
   if (!sourceBuffer || !mediaSource || mediaSource.readyState !== 'open') return;
   if (sourceBuffer.updating) return;
   const video = document.getElementById('viewer-video');
-  if (video.readyState < 2) return;  // nog niets afgespeeld
-
+  if (video.readyState < 2) return;
   try {
     const buffered = sourceBuffer.buffered;
     if (buffered.length === 0) return;
     const liveEdge = buffered.end(buffered.length - 1);
-    const behind = liveEdge - video.currentTime;
-    if (behind > 1.5) {
-      // Meer dan 1.5s achter — spring naar live edge min een kleine marge
-      video.currentTime = liveEdge - 0.1;
-    }
+    if (liveEdge - video.currentTime > 1.5) video.currentTime = liveEdge - 0.1;
   } catch (e) { /* ignore */ }
 }
 
 function drainQueue() {
-  if (isAppending) return;
-  if (!sourceBuffer || sourceBuffer.updating) return;
+  if (isAppending) { console.log('[drain] skip: isAppending'); return; }
+  if (!sourceBuffer || sourceBuffer.updating) { console.log('[drain] skip: sb.updating=', sourceBuffer?.updating); return; }
+  if (!mediaSource || mediaSource.readyState !== 'open') { console.log('[drain] skip: ms.readyState=', mediaSource?.readyState); return; }
   if (pendingChunks.length === 0) return;
-  if (!mediaSource || mediaSource.readyState !== 'open') return;
+
+  const next = pendingChunks[0];
+  if (!next.isInit && !initDone) { console.log('[drain] skip: waiting for init'); return; }
 
   isAppending = true;
   const item = pendingChunks.shift();
+  console.log('[drain] appending isInit=', item.isInit, 'bytes=', item.data.byteLength, 'queueLeft=', pendingChunks.length);
   document.getElementById('v-queue').textContent = pendingChunks.length;
 
-  // CRITICAL: listener registreren VÓÓR appendBuffer aanroepen.
-  // In sommige browsers/situaties kan updateend synchroon vuren.
   function onUpdateEnd() {
     isAppending = false;
-
-    // Als dit de init was, zet initDone op true zodat media-chunks
-    // pas daarna in de queue komen. Zo kan de SourceBuffer nooit
-    // media ontvangen terwijl de codec-initialisatie nog loopt.
     if (item.isInit) {
       initDone = true;
       setStatus('v-status', 'Init verwerkt, stream start...', 'info');
     }
-
     drainQueue();
   }
   sourceBuffer.addEventListener('updateend', onUpdateEnd, { once: true });
@@ -359,11 +427,10 @@ function drainQueue() {
     sourceBuffer.appendBuffer(item.data);
   } catch (err) {
     sourceBuffer.removeEventListener('updateend', onUpdateEnd);
-    console.error('appendBuffer error:', err.name, err.message);
+    console.error('[drain] appendBuffer error:', err.name, err.message, 'isInit=', item.isInit);
     isAppending = false;
     if (err.name === 'QuotaExceededError') {
       evictOldBuffer();
-      // Zet het item terug en probeer opnieuw na de evict
       pendingChunks.unshift(item);
       setTimeout(drainQueue, 50);
     }
@@ -372,25 +439,17 @@ function drainQueue() {
 
 function queueChunk(data, isInit = false) {
   if (isInit) {
-    // Init vervangt alles: leeg de queue en begin opnieuw
     pendingChunks = [{ data, isInit: true }];
     initDone = false;
-    isAppending = false;
     drainQueue();
     return;
   }
 
-  // Media-chunk: alleen toevoegen als init al verwerkt is
+  // Gewone media-chunk: wachten totdat init verwerkt is
   if (!initDone) return;
 
   pendingChunks.push({ data, isInit: false });
-
-  // Begrens de queue: als hij te lang wordt, gooi dan de oudste
-  // media-chunks weg (niet de init). Zo blijven we dicht op live.
-  while (pendingChunks.length > MAX_QUEUE) {
-    pendingChunks.shift();
-  }
-
+  while (pendingChunks.length > MAX_QUEUE) pendingChunks.shift();
   document.getElementById('v-queue').textContent = pendingChunks.length;
   drainQueue();
 }
@@ -399,10 +458,7 @@ async function openSourceBuffer() {
   let serverMime = '';
   try {
     const res = await fetch('/api/stream/info');
-    if (res.ok) {
-      const info = await res.json();
-      serverMime = info.mimeType || '';
-    }
+    if (res.ok) serverMime = (await res.json()).mimeType || '';
   } catch (e) { /* val terug op kandidatenlijst */ }
 
   const candidates = serverMime
@@ -417,8 +473,6 @@ async function openSourceBuffer() {
       activeMime = mime;
       setStatus('v-status', `Verbonden (${mime}). Wachten op stream...`, 'info');
       connectEventSource();
-
-      // Elke seconde live-sync controleren
       liveTimer = setInterval(syncToLive, 1000);
       return;
     } catch (e) { /* probeer volgende */ }
@@ -427,7 +481,6 @@ async function openSourceBuffer() {
 }
 
 function startWatching() {
-  // State resetten
   pendingChunks = [];
   initDone      = false;
   isAppending   = false;
@@ -441,10 +494,15 @@ function startWatching() {
   video.src = URL.createObjectURL(mediaSource);
 
   mediaSource.addEventListener('sourceopen', openSourceBuffer);
-  mediaSource.addEventListener('sourceended', () =>
-    setStatus('v-status', 'Stream beëindigd.', 'info'));
-  mediaSource.addEventListener('sourceclose', () =>
-    setStatus('v-status', 'MediaSource gesloten.', 'info'));
+  mediaSource.addEventListener('sourceended', () => {
+    console.log('[ms] sourceended — readyState=', mediaSource.readyState);
+    console.trace();
+    setStatus('v-status', 'Stream beëindigd.', 'info');
+  });
+  mediaSource.addEventListener('sourceclose', () => {
+    console.log('[ms] sourceclose — readyState=', mediaSource.readyState);
+    setStatus('v-status', 'MediaSource gesloten.', 'info');
+  });
 
   document.getElementById('v-start').disabled = true;
   document.getElementById('v-stop').disabled  = false;
@@ -457,7 +515,6 @@ function connectEventSource() {
   eventSource.onopen = () =>
     setStatus('v-status', 'Verbonden. Wachten op init-segment...', 'info');
 
-  // Init-event: WebM EBML-header — moet EERST in de SourceBuffer
   eventSource.addEventListener('init', (event) => {
     vChunkCount = 0;
     document.getElementById('v-chunks').textContent = '0';
@@ -465,24 +522,21 @@ function connectEventSource() {
     queueChunk(base64ToUint8Array(event.data), true);
   });
 
-  // Chunk-event: gewone WebM media-cluster
-  eventSource.addEventListener('chunk', (event) => {
-    const bytes = base64ToUint8Array(event.data);
-    queueChunk(bytes, false);
+  // keyframe en chunk zijn beide gewone media-chunks voor de viewer —
+  // het onderscheid is alleen relevant voor de server-side catch-up logica.
+  function onMediaChunk(event) {
+    queueChunk(base64ToUint8Array(event.data), false, false);
     vChunkCount++;
     document.getElementById('v-chunks').textContent = vChunkCount;
-
-    // Autoplay als video gepauzeerd is maar er wel data is
     const video = document.getElementById('viewer-video');
     if (video.paused && video.readyState >= 3) video.play().catch(() => {});
-
     if (vChunkCount === 1) setStatus('v-status', 'Stream actief.', 'ok');
-  });
+  }
+  eventSource.addEventListener('keyframe', onMediaChunk);
+  eventSource.addEventListener('chunk',    onMediaChunk);
 
   eventSource.onerror = () => {
     setStatus('v-status', 'Verbinding onderbroken, herverbinden...', 'err');
-    // Bij herverbinding stuurt de server opnieuw het init-segment;
-    // reset zodat queueChunk dat correct als init behandelt.
     initDone      = false;
     pendingChunks = [];
     isAppending   = false;
@@ -491,7 +545,6 @@ function connectEventSource() {
 
 function stopWatching() {
   if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
-
   if (eventSource) { eventSource.close(); eventSource = null; }
 
   pendingChunks = [];
@@ -509,7 +562,6 @@ function stopWatching() {
     video.load();
   }
 
-  // endOfStream mag niet worden aangeroepen terwijl updating=true
   if (sourceBuffer && sourceBuffer.updating) {
     sourceBuffer.addEventListener('updateend', teardown, { once: true });
   } else {

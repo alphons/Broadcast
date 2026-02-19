@@ -35,9 +35,11 @@ public class StreamController : ControllerBase
 
         // Broadcaster sends its actual mimeType in X-Mime-Type header so viewers
         // can call addSourceBuffer() with the exact same codec string.
-        var mimeType = Request.Headers["X-Mime-Type"].FirstOrDefault() ?? "video/webm;codecs=vp8,opus";
+        var mimeType   = Request.Headers["X-Mime-Type"].FirstOrDefault() ?? "video/webm;codecs=vp8,opus";
+        var isInit     = Request.Headers["X-Is-Init"].FirstOrDefault() == "true";
+        var isKeyframe = Request.Headers["X-Is-Keyframe"].FirstOrDefault() == "true";
 
-        await _hub.BroadcastChunkAsync(data, mimeType, ct);
+        await _hub.BroadcastChunkAsync(data, mimeType, isInit, isKeyframe, ct);
 
         return Ok(new { received = data.Length, viewers = _hub.ViewerCount });
     }
@@ -93,7 +95,9 @@ public class StreamController : ControllerBase
 
                     var chunk = enumerator.Current;
                     var base64 = Convert.ToBase64String(chunk.Data);
-                    var eventType = chunk.IsInit ? "init" : "chunk";
+                    var eventType = chunk.IsInit ? "init"
+                                 : chunk.IsKeyframe ? "keyframe"
+                                 : "chunk";
 
                     yield return new SseItem<string>(base64, eventType)
                     {

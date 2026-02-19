@@ -6,7 +6,8 @@ namespace Broadcast.Services;
 
 /// <summary>
 /// Singleton service that manages the live broadcast.
-/// Stores the WebM init segment so late-joining viewers get a decodable stream.
+/// Stores the WebM init segment and the most recent keyframe chunk so
+/// late-joining viewers always start at a clean decode boundary.
 /// Maintains one bounded Channel per viewer for fan-out delivery.
 /// </summary>
 public sealed class BroadcastHub
@@ -14,7 +15,13 @@ public sealed class BroadcastHub
     // The very first WebM chunk — EBML header + Segment/Info/Tracks.
     // Stored so late-joining viewers receive it before any media data.
     private VideoChunk? _initSegment;
-    private readonly object _initLock = new();
+
+    // The most recent chunk flagged as a keyframe by the broadcaster.
+    // A late-joining viewer gets: init → _keyframeChunk → live stream.
+    // This guarantees the viewer's decoder always starts at a valid I-frame.
+    private VideoChunk? _keyframeChunk;
+
+    private readonly object _stateLock = new();
 
     // The exact mimeType string the broadcaster's MediaRecorder is using.
     // Viewers MUST use this same codec string for addSourceBuffer().
@@ -32,31 +39,33 @@ public sealed class BroadcastHub
 
     /// <summary>
     /// Called by the broadcaster POST endpoint for each binary WebM chunk.
-    /// Stores the init segment on first call, then fans the chunk to all viewers.
-    /// mimeType is the codec string from the broadcaster's MediaRecorder.
+    /// isKeyframe comes from the broadcaster's own SimpleBlock flag inspection,
+    /// which is more reliable than server-side EBML parsing.
     /// </summary>
-    public Task BroadcastChunkAsync(byte[] data, string mimeType, CancellationToken ct)
+    public Task BroadcastChunkAsync(byte[] data, string mimeType, bool isInit, bool isKeyframe, CancellationToken ct)
     {
         long seq = Interlocked.Increment(ref _sequence);
-        bool isInit = seq == 1;
 
         var chunk = new VideoChunk
         {
             Data = data,
             IsInit = isInit,
+            IsKeyframe = isKeyframe,
             SequenceNumber = seq
         };
 
-        // Store the init segment and mimeType exactly once.
-        if (isInit)
+        lock (_stateLock)
         {
-            lock (_initLock)
+            if (isInit)
             {
-                if (_initSegment is null)
-                {
-                    _initSegment = chunk;
-                    MimeType = mimeType;
-                }
+                _initSegment = chunk;           // always overwrite — broadcaster said so
+                _keyframeChunk = null;          // new session: discard old keyframe
+                MimeType = mimeType;
+            }
+            else if (isKeyframe)
+            {
+                // Keep only the most recent keyframe chunk as the catch-up entry point.
+                _keyframeChunk = chunk;
             }
         }
 
@@ -71,8 +80,8 @@ public sealed class BroadcastHub
     }
 
     /// <summary>
-    /// Registers a new viewer. If broadcast has already started, pre-queues the
-    /// init segment so the viewer receives it immediately upon connection.
+    /// Registers a new viewer. Pre-queues init and the most recent keyframe chunk
+    /// so the viewer can start decoding immediately without waiting for the next keyframe.
     /// </summary>
     public (Guid viewerId, ChannelReader<VideoChunk> reader) AddViewer()
     {
@@ -88,16 +97,17 @@ public sealed class BroadcastHub
         var channel = Channel.CreateBounded<VideoChunk>(options);
         _viewers[viewerId] = channel;
 
-        // Pre-queue the init segment for late-joining viewers.
-        VideoChunk? existingInit;
-        lock (_initLock)
+        VideoChunk? initSnap;
+        VideoChunk? keySnap;
+        lock (_stateLock)
         {
-            existingInit = _initSegment;
+            initSnap = _initSegment;
+            keySnap  = _keyframeChunk;
         }
 
-        if (existingInit is not null)
+        if (initSnap is not null)
         {
-            channel.Writer.TryWrite(existingInit);
+            channel.Writer.TryWrite(initSnap);
         }
 
         return (viewerId, channel.Reader);
@@ -123,17 +133,15 @@ public sealed class BroadcastHub
 
     /// <summary>
     /// Resets the broadcast state so a new broadcast can start.
-    /// Clears the stored init segment and resets the sequence counter.
-    /// Connected viewers are NOT disconnected — they will receive an error
-    /// when they try to append new chunks with a mismatched init.
     /// </summary>
     public void ResetBroadcast()
     {
-        lock (_initLock)
+        lock (_stateLock)
         {
-            _initSegment = null;
+            _initSegment   = null;
+            _keyframeChunk = null;
+            Interlocked.Exchange(ref _sequence, 0);
+            MimeType = string.Empty;
         }
-        Interlocked.Exchange(ref _sequence, 0);
-        MimeType = string.Empty;
     }
 }

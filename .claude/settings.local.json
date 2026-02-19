@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(dotnet build:*)",
+      "Bash(timeout /t 5)",
+      "Bash(del \"D:\\\\git\\\\Broadcast\\\\src\\\\Services\\\\WebMParser.cs\")"
+    ]
+  }
+}
